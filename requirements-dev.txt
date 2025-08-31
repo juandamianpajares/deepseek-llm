@@ -1,0 +1,29 @@
+# requirements-dev.txt
+# Dependencias para desarrollo y testing
+
+# Testing
+pytest==7.4.4
+pytest-asyncio==0.23.5
+pytest-cov==4.1.0
+httpx==0.26.0
+
+# Code quality
+black==23.12.1
+flake8==6.1.0
+isort==5.13.2
+mypy==1.8.0
+pre-commit==3.6.1
+
+# Documentation
+mkdocs==1.5.3
+mkdocs-material==9.5.3
+mkdocstrings[python]==0.24.0
+
+# Jupyter
+jupyter==1.0.0
+ipython==8.22.2
+ipykernel==6.29.3
+
+# Debugging
+debugpy==1.8.0
+rich==13.7.1

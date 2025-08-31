@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+# local_llm.py - LLM local como fallback (versión corregida)
+
+import os
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from typing import List, Dict, Optional
+import torch
+import logging
+from dotenv import load_dotenv
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Cargar variables de entorno
+load_dotenv()
+
+class LocalLLMClient:
+    def __init__(self):
+        # Usar un modelo más pequeño y eficiente para CPU
+        self.model_name = "microsoft/DialoGPT-small"  # Modelo pequeño para CPU
+        self.tokenizer = None
+        self.model = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        logger.info(f"Inicializando modelo local: {self.model_name}")
+        logger.info(f"Dispositivo: {self.device}")
+        
+    def load_model(self):
+        """Cargar el modelo local"""
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+            # CORRECCIÓN: Usar dtype en lugar de torch_dtype
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                dtype=torch.float32 if self.device == "cpu" else torch.float16,
+                low_cpu_mem_usage=True
+            )
+            self.model.to(self.device)
+            logger.info("Modelo local cargado exitosamente")
+            return True
+        except Exception as e:
+            logger.error(f"Error cargando modelo local: {e}")
+            return False
+    
+    def generate_response(self, messages: List[Dict], **kwargs) -> Dict:
+        """Generar respuesta usando modelo local"""
+        
+        # Si el modelo no está cargado, intentar cargarlo
+        if self.model is None:
+            if not self.load_model():
+                return {"error": "No se pudo cargar el modelo local"}
+        
+        # Convertir mensajes a texto
+        conversation = ""
+        for msg in messages:
+            conversation += f"{msg['role']}: {msg['content']}\n"
+        
+        conversation += "assistant: "
+        
+        try:
+            # Tokenizar entrada
+            inputs = self.tokenizer.encode(conversation, return_tensors="pt")
+            inputs = inputs.to(self.device)
+            
+            # Generar respuesta
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    inputs,
+                    max_length=kwargs.get("max_length", 150),
+                    temperature=kwargs.get("temperature", 0.7),
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    num_return_sequences=1
+                )
+            
+            # Decodificar respuesta
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            # Extraer solo la parte del assistant
+            if "assistant:" in response:
+                response = response.split("assistant:")[-1].strip()
+            
+            return {
+                "choices": [{
+                    "message": {
+                        "content": response,
+                        "role": "assistant"
+                    }
+                }],
+                "model": self.model_name,
+                "usage": {
+                    "prompt_tokens": len(inputs[0]),
+                    "completion_tokens": len(outputs[0]) - len(inputs[0]),
+                    "total_tokens": len(outputs[0])
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error generando respuesta: {e}")
+            return {"error": f"Error en generación local: {str(e)}"}
+
+# Cliente híbrido que intenta DeepSeek primero, luego fallback local
+class HybridLLMClient:
+    def __init__(self):
+        self.deepseek_client = None
+        self.local_client = LocalLLMClient()
+        self.use_local = False
+        
+        # Verificar si tenemos API key de DeepSeek
+        self.api_key = os.getenv("DEEPSEEK_API_KEY")
+        if not self.api_key or self.api_key == "tu_api_key_real_aqui":
+            logger.warning("API key de DeepSeek no configurada. Usando modelo local.")
+            self.use_local = True
+        else:
+            try:
+                import openai
+                self.deepseek_client = openai.OpenAI(
+                    api_key=self.api_key,
+                    base_url="https://api.deepseek.com/v1"
+                )
+                logger.info("Cliente DeepSeek configurado")
+            except ImportError:
+                logger.warning("OpenAI package no instalado. Usando modelo local.")
+                self.use_local = True
+            except Exception as e:
+                logger.warning(f"Error configurando DeepSeek: {e}. Usando modelo local.")
+                self.use_local = True
+    
+    async def chat_completion(self, messages: List[Dict], **kwargs) -> Dict:
+        """Chat completion con fallback a modelo local"""
+        
+        if self.use_local or self.deepseek_client is None:
+            return self.local_client.generate_response(messages, **kwargs)
+        
+        # Intentar con DeepSeek
+        try:
+            import openai
+            
+            response = self.deepseek_client.chat.completions.create(
+                model=kwargs.get("model", "deepseek-chat"),
+                messages=messages,
+                temperature=kwargs.get("temperature", 0.7),
+                max_tokens=kwargs.get("max_tokens", 2048),
+                stream=False
+            )
+            
+            return {
+                "choices": [{
+                    "message": {
+                        "content": response.choices[0].message.content,
+                        "role": response.choices[0].message.role
+                    }
+                }],
+                "model": response.model,
+                "usage": {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens
+                }
+            }
+            
+        except Exception as e:
+            logger.warning(f"Error con DeepSeek API: {e}. Fallback a modelo local.")
+            return self.local_client.generate_response(messages, **kwargs)
+
+# Prueba del cliente local
+if __name__ == "__main__":
+    client = LocalLLMClient()
+    
+    # Probar con un mensaje simple
+    test_messages = [
+        {"role": "user", "content": "Hola, ¿cómo estás?"}
+    ]
+    
+    result = client.generate_response(test_messages, max_length=100, temperature=0.8)
+    
+    if "error" in result:
+        print(f"Error: {result['error']}")
+    else: print("Respuesta del modelo local:") print(result["choices"][0]["message"]["content"]) 
+        print(f"\nModelo: {result['model']}") print(f"Tokens: {result['usage']['total_tokens']}")
